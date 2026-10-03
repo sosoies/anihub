@@ -1,0 +1,612 @@
+import { createHash } from "node:crypto";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { deleteUploadedSubtitle as deleteLegacyUploadedSubtitle, getUploadedSubtitle as getLegacyUploadedSubtitle } from "@/lib/db";
+import { extractSubtitleFromBuffer, decodeSubtitleFile } from "@/lib/subtitles";
+import { episodeFromSubtitleFilename, inspectSubtitleArchive } from "@/lib/subtitleUpload";
+import { parseSeason } from "@/lib/subtitles";
+import { readEpisodeEvidence, evidenceAgrees, selectEpisodeEntries } from "@/lib/subtitleEpisodes";
+import { bundleScopeKey, parseBundleScope, localFileKey, parseLocalFileKey, subtitleScope, scopeLabel, bundleScopesOverlap, bundleMatchesAssignment } from './subtitleLocalIdentity';
+
+import {readSubtitleSourceManifest,sourceDigestMatches,sourceTrackIdentity} from './subtitleSourceManifest';
+import type {DownloadRecord} from './subtitleSourceManifest';
+
+const root = process.env.SUBTITLE_STORAGE_DIR || path.join(process.cwd(), "data", "subtitles");
+const safeSegment = (value: string) => {
+  if (!value || value.length > 100) throw new Error("Invalid subtitle storage key");
+  return encodeURIComponent(value).replaceAll(".", "%2E");
+};
+const episodeName = (episode: number) => {
+  if (!Number.isSafeInteger(episode) || episode < 1 || episode > 10000) throw new Error("Invalid episode number");
+  return String(episode).padStart(4, "0");
+};
+const formatOf = (format: "ASS" | "VTT") => format === "ASS" ? "ass" : "vtt";
+const normalizeBlogTitle = (value: string) => value.normalize("NFKC").toLocaleLowerCase("ko-KR")
+  .replace(/[^\p{L}\p{N}]+/gu, "");
+
+function anissiaFolderParts(finishPath: string) {
+  const relative = path.relative(path.join(root, "anissia_subtitles"), path.dirname(finishPath));
+  const parts = relative.split(path.sep).filter(Boolean);
+  const identity = parts[0]?.match(/^([1-9]\d*)__([\s\S]+)$/);
+  return {
+    title: identity?.[2] || parts[0] || "",
+    animeNo: identity && Number.isSafeInteger(Number(identity[1])) ? Number(identity[1]) : null,
+    episode: parts[1] || "",
+    creator: parts[2] || "",
+  };
+}
+
+async function atomicWrite(filePath: string, content: string | Buffer) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, content);
+  await rename(tempPath, filePath);
+}
+
+export async function getUploadedSubtitle(userId: string, animeId: string, episode: number) {
+  const legacy = () => getLegacyUploadedSubtitle(userId, animeId, episode);
+  try {
+    const dir = path.join(root, "uploads", safeSegment(userId), safeSegment(animeId));
+    const base = episodeName(episode);
+    const meta = JSON.parse(await readFile(path.join(dir, `${base}.json`), "utf8"));
+    const content = await readFile(path.join(dir, `${base}.${formatOf(meta.format)}`), "utf8");
+    return { name: `Pi 저장: ${meta.filename}`, orig_filename: meta.filename, content,
+      format: meta.format as "ASS" | "VTT", is_ass: meta.format === "ASS" };
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+    return legacy();
+  }
+}
+
+export async function getUploadedSubtitles(userId: string, animeId: string, episode: number) {
+  const baseDir = path.join(root, "uploads", safeSegment(userId), safeSegment(animeId));
+  const candidatesDir = path.join(baseDir, "candidates", episodeName(episode));
+  let names: string[] = [];
+  try { names = await readdir(candidatesDir); } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const candidates = await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+    try {
+      const metadata = JSON.parse(await readFile(path.join(candidatesDir, name), "utf8"));
+      const format = metadata.format === "ASS" ? "ASS" : "VTT";
+      const hash = name.slice(0, -5);
+      const content = await readFile(path.join(candidatesDir, `${hash}.${formatOf(format)}`), "utf8");
+      return {
+        name: `Pi 저장: ${metadata.filename}`,
+        orig_filename: metadata.filename,
+        content,
+        format,
+        is_ass: format === "ASS",
+      };
+    } catch { return null; }
+  }));
+  const legacy = await getUploadedSubtitle(userId, animeId, episode);
+  const all = [...candidates.filter((item): item is NonNullable<typeof item> => Boolean(item)), ...(legacy ? [legacy] : [])];
+  return all.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+export async function saveUploadedSubtitleCandidates(userId: string, animeId: string,
+  subtitles: Array<{ episode: number; filename: string; content: string; format: "ASS" | "VTT" }>) {
+  const animeSegment = safeSegment(animeId);
+  const userSegment = safeSegment(userId);
+  for (const subtitle of subtitles) {
+    const baseDir = path.join(root, "uploads", userSegment, animeSegment, "candidates", episodeName(subtitle.episode));
+    const id = createHash("sha256")
+      .update(subtitle.filename).update("\\0").update(subtitle.format).update("\\0").update(subtitle.content).digest("hex");
+    const format = formatOf(subtitle.format);
+    await atomicWrite(path.join(baseDir, `${id}.${format}`), subtitle.content);
+    await atomicWrite(path.join(baseDir, `${id}.json`), JSON.stringify({
+      filename: subtitle.filename, format: subtitle.format, updatedAt: new Date().toISOString(),
+    }));
+  }
+}
+
+export async function saveUploadedSubtitle(userId: string, animeId: string, episode: number,
+  filename: string, content: string, format: "ASS" | "VTT") {
+  const dir = path.join(root, "uploads", safeSegment(userId), safeSegment(animeId));
+  const base = episodeName(episode);
+  const metaPath = path.join(dir, `${base}.json`);
+  let previousFormat: "ASS" | "VTT" | null = null;
+  try { previousFormat = JSON.parse(await readFile(metaPath, "utf8")).format; } catch {}
+  await atomicWrite(path.join(dir, `${base}.${formatOf(format)}`), content);
+  await atomicWrite(metaPath, JSON.stringify({ filename, format, updatedAt: new Date().toISOString() }));
+  if (previousFormat && previousFormat !== format) {
+    await rm(path.join(dir, `${base}.${formatOf(previousFormat)}`), { force: true });
+  }
+  await deleteLegacyUploadedSubtitle(userId, animeId, episode);
+}
+
+export async function saveUploadedSubtitles(userId: string, animeId: string,
+  subtitles: Array<{ episode: number; filename: string; content: string; format: "ASS" | "VTT" }>) {
+  for (const subtitle of subtitles) {
+    await saveUploadedSubtitle(userId, animeId, subtitle.episode, subtitle.filename, subtitle.content, subtitle.format);
+  }
+}
+
+export async function deleteUploadedSubtitle(userId: string, animeId: string, episode: number) {
+  const dir = path.join(root, "uploads", safeSegment(userId), safeSegment(animeId));
+  const base = episodeName(episode);
+  await Promise.all([
+    ...["json", "ass", "vtt"].map((ext) => rm(path.join(dir, `${base}.${ext}`), { force: true })),
+    rm(path.join(dir, "candidates", base), { recursive: true, force: true }),
+  ]);
+  await deleteLegacyUploadedSubtitle(userId, animeId, episode);
+}
+
+export { getVerifiedSubtitleCache, saveVerifiedSubtitleCache } from "@/lib/subtitleCache";
+
+export interface AnissiaArchiveSubtitle {
+  name: string;
+  orig_filename: string;
+  content: string;
+  format: "ASS" | "VTT";
+  is_ass: boolean;
+  episode: number;
+  creator: string;
+  website: string;
+  matchedTitle: string;
+  updatedAt: string;
+  animeNo: number | null;
+  archiveFilename: string;
+  localArchiveTrackKey: string;
+  localArchiveTrackLabel: string;
+  sourceFolderKey: string;
+  sourceFolderLabel: string;
+  sourceBundleKey: string;
+  sourceBundleLabel: string;
+  localFileId: string;
+  episodeConfirmed: boolean;
+}
+
+interface AnissiaArchiveIndexEntry {
+  finishPath: string;
+  record: Record<string, any>;
+  updatedAt: string;
+}
+
+let anissiaArchiveIndex: { entries: AnissiaArchiveIndexEntry[]; expiresAt: number } | null = null;
+let anissiaArchiveIndexPromise: Promise<AnissiaArchiveIndexEntry[]> | null = null;
+
+function recordObjects(record: Record<string, any>): Record<string, any>[] {
+  return [record, record.data, record.anime, record.work, record.caption, record.item]
+    .filter((item): item is Record<string, any> => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+}
+
+function recordValue(record: Record<string, any>, keys: string[]): string {
+  for (const object of recordObjects(record)) {
+    for (const key of keys) {
+      const value = object[key];
+      if (typeof value === "string" || typeof value === "number") {
+        const text = String(value).trim();
+        if (text) return text;
+      }
+    }
+  }
+  return "";
+}
+
+function recordNumber(record: Record<string, any>, keys: string[]): number | null {
+  const value = recordValue(record, keys);
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+async function loadAnissiaArchiveIndex(): Promise<AnissiaArchiveIndexEntry[]> {
+  const corpus = path.join(root, "anissia_subtitles");
+  const finishPaths: string[] = [];
+  const archiveDirs = new Set<string>();
+  const pending: Array<{ dir: string; depth: number }> = [{ dir: corpus, depth: 0 }];
+  // Count-independent traversal: migrated libraries can contain over 50,000
+  // files. Truncating here silently omits works based on filesystem order.
+  while (pending.length) {
+    const current = pending.pop()!;
+    let entries;
+    try {
+      entries = await readdir(current.dir, { withFileTypes: true });
+    } catch (error: any) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (entries.some((entry) => entry.isFile() && /\.(zip|ass|ssa|smi|srt|vtt)$/i.test(entry.name))) {
+      archiveDirs.add(current.dir);
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "__MACOSX") continue;
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory() && current.depth < 10) pending.push({ dir: fullPath, depth: current.depth + 1 });
+      else if (entry.isFile() && entry.name.toLowerCase() === "finish.txt") {
+        finishPaths.push(fullPath);
+      }
+    }
+  }
+
+  const indexed = await Promise.all(finishPaths.map(async (finishPath) => {
+    try {
+      const info = await stat(finishPath);
+      if (info.size <= 0 || info.size > 256 * 1024) return null;
+      const record = JSON.parse(await readFile(finishPath, "utf8"));
+      if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+      const updatedAt = recordValue(record, ["updDt", "updatedAt", "updateDate", "updated", "date"]);
+      return { finishPath, record, updatedAt };
+    } catch {
+      return null;
+    }
+  }));
+
+  const finishDirs = new Set(indexed.filter((entry) => entry !== null)
+    .map((entry) => path.dirname(entry!.finishPath)));
+
+  // Manually saved Anissia archives may not have finish.txt. Infer metadata
+  // from the same title/episode/creator directory layout and ZIP filename.
+  const inferred = await Promise.all([...archiveDirs].filter((dir) => !finishDirs.has(dir)).map(async (dir) => {
+    try {
+      const files = (await readdir(dir)).filter((name) => /\.(zip|ass|ssa|smi|srt|vtt)$/i.test(name));
+      const stats = await Promise.all(files.map((name) => stat(path.join(dir, name))));
+      const latestModified = Math.max(0, ...stats.map((info) => info.mtimeMs));
+      return {
+        finishPath: path.join(dir, "finish.txt"),
+        record: {},
+        updatedAt: latestModified ? new Date(latestModified).toISOString() : "",
+      };
+    } catch {
+      return null;
+    }
+  }));
+
+  return [...indexed, ...inferred].filter((entry): entry is AnissiaArchiveIndexEntry => Boolean(entry));
+}
+async function getAnissiaArchiveIndex(): Promise<AnissiaArchiveIndexEntry[]> {
+  if (anissiaArchiveIndex && anissiaArchiveIndex.expiresAt > Date.now()) return anissiaArchiveIndex.entries;
+  if (!anissiaArchiveIndexPromise) {
+    anissiaArchiveIndexPromise = loadAnissiaArchiveIndex()
+      .then((entries) => {
+        anissiaArchiveIndex = { entries, expiresAt: Date.now() + 60_000 };
+        return entries;
+      })
+      .finally(() => { anissiaArchiveIndexPromise = null; });
+  }
+  return anissiaArchiveIndexPromise;
+}
+
+export async function getLocalSubtitleFolder(bundleKey:string) {
+  const scope=parseBundleScope(bundleKey);if(scope?.type!=='folder')return null;
+  try {
+    const base=path.join(root,`${scope.provider}_subtitles`),dir=path.join(base,scope.work);
+    const actualRoot=await realpath(root),actualBase=await realpath(base),actual=await realpath(dir);
+    if(!actualBase.startsWith(actualRoot+path.sep) || !actual.startsWith(actualBase+path.sep) || !(await stat(dir)).isDirectory())return null;
+    // Refuse directory aliases so ownership has exactly one physical name.
+    if(actual!==dir || actualBase!==base)return null;
+    return {folderName:scope.work,provider:scope.provider,folderKey:bundleKey,
+      label:scopeLabel(scope.work.replace(/^[1-9]\d*__/,''),scope)};
+  }catch(error:any){if(error.code==='ENOENT' || error.code==='ENOTDIR')return null;throw error;}
+}
+export async function searchLocalSubtitleFolders(query:string) {
+  const needle=normalizeBlogTitle(query);if(needle.length<2)return [];
+  const matches:Array<{folderName:string;provider:'aniall'|'anissia';folderKey:string}>=[];
+  for(const provider of ['aniall','anissia'] as const) {
+    try {
+      for(const entry of await readdir(path.join(root,`${provider}_subtitles`),{withFileTypes:true})) {
+        if(!entry.isDirectory() || entry.name.startsWith('.') || !normalizeBlogTitle(entry.name).includes(needle))continue;
+        const scope=subtitleScope('',entry.name);
+        matches.push({folderName:entry.name,provider,folderKey:bundleScopeKey({type:'folder',provider,work:entry.name,...scope})});
+      }
+    }catch(error:any){if(error.code!=='ENOENT')throw error;}
+  }
+  return matches.sort((a,b)=>a.folderName.localeCompare(b.folderName,'ko')).slice(0,200);
+}
+
+function normalizeAnissiaTrackFilename(filename: string, episode: number): string {
+  const base = path.basename(filename).replace(/\.(ass|ssa|smi|srt|vtt|zip)$/i, "")
+    .replace(/\b(s\s*0*\d{1,2}\s*e\s*)0*\d{1,4}(?!\d)/gi,'$1{ep}');
+  const patterns = [
+    new RegExp("(^|[\\s_-])0*" + episode + "(?=__\\d+$)"),
+    new RegExp("(^|[\\s_-])0*" + episode + "(?=[A-Za-z][A-Za-z0-9._-]*$)"),
+    new RegExp("(^|[^a-z\\d])(?:episode|ep|e|#)\\s*0*" + episode + "(?!\\d)", "i"),
+    new RegExp("((?:제|第\\s*)?0*)" + episode + "(\\s*(?:화|회|편|話))"),
+    new RegExp("(^|[\\s_-])0*" + episode + "$"),
+  ];
+  for (const pattern of patterns) {
+    const match = base.match(pattern);
+    if (match) {
+      const prefix = match[1] || "";
+      const suffix = match[2] || "";
+      return base.replace(pattern, `${prefix}{ep}${suffix}`);
+    }
+  }
+  return base;
+}
+
+function anissiaTrackIdentity(creator: string, archiveFilename: string, entryFilename: string, episode: number) {
+  const rangePattern = /(?:^|[^\d])\d{1,3}\s*[-~]\s*\d{1,3}(?!\d)/;
+  const archiveBase = path.basename(archiveFilename).replace(/\.(zip)$/i, "").replace(rangePattern, "{range}");
+  const normalizedArchive = normalizeAnissiaTrackFilename(archiveBase, episode);
+  const entryEpisode = episodeFromSubtitleFilename(entryFilename);
+  const normalizedEntry = entryEpisode === episode ? normalizeAnissiaTrackFilename(entryFilename, episode) : "";
+  const trackKey = [normalizeBlogTitle(creator), normalizeBlogTitle(normalizedArchive), normalizeBlogTitle(normalizedEntry)].join("|");
+  const entryTrack = normalizedEntry.match(/\{ep\}([a-z][a-z0-9._-]*)$/i)?.[1] || "";
+  const archiveTrack = normalizedArchive.match(/(?:\{ep\}|\{range\})([a-z][a-z0-9._-]*)$/i)?.[1] || "";
+  const variant = entryTrack || archiveTrack;
+  const trackLabel = /^ns$/i.test(variant) ? "논스폰서판"
+    : /^s$/i.test(variant) ? "스폰서판"
+      : variant ? variant + " 트랙" : "자막 트랙";
+  return { localArchiveTrackKey: trackKey, localArchiveTrackLabel: trackLabel };
+}
+
+function rawBundleIdentity(provider: 'aniall'|'anissia', relative: string, member: string, creator: string, title: string, sourceRecord?:DownloadRecord) {
+  const parts=relative.split('/'),filename=parts[parts.length-1];
+  const evidence=readEpisodeEvidence(parts[2] || '');
+  const episode=episodeFromSubtitleFilename(member || filename) || (evidence.episodes.length===1 ? evidence.episodes[0] : 1);
+  const identity=anissiaTrackIdentity(creator,filename,member || filename,episode);
+  const scope=subtitleScope(member || parts.slice(2).join('/'),`${title} ${filename}`,parseSeason(title) || 1);
+  return {sourceFolderKey:bundleScopeKey({type:'folder',provider,work:parts[1],...scope}),sourceFolderLabel:scopeLabel(title,scope),
+    sourceBundleKey:bundleScopeKey({type:'local',provider,work:parts[1],track:identity.localArchiveTrackKey+(sourceRecord ? '|source:'+sourceTrackIdentity(sourceRecord) : ''),...scope}),
+    sourceBundleLabel:scopeLabel(title,scope)};
+}
+/** Find an offline Anissia subtitle archive using its adjacent finish.txt metadata. */
+export async function getAnissiaArchiveSubtitles(
+  titles: string[],
+  episode: number,
+  animeNo?: number | null,
+  seasonNumber?: number | null,
+  options: { folderNameQuery?: string; maxResults?: number; localEpisode?: number; bundleKey?: string; manualSearch?: boolean } = {},
+): Promise<AnissiaArchiveSubtitle[]> {
+  if (!Number.isSafeInteger(episode) || episode < 1) return [];
+  const wantedTitles = new Set(titles.map(normalizeBlogTitle).filter((value) => value.length >= 2));
+  const folderNameQuery = normalizeBlogTitle(options.folderNameQuery || "");
+  const resultLimit = options.maxResults || (folderNameQuery ? 50 : 12);
+  const assignedScope = options.bundleKey ? parseBundleScope(options.bundleKey) : null;
+  if (options.bundleKey && (!assignedScope || (assignedScope.type!=='local' && assignedScope.type!=='folder') || assignedScope.provider !== 'anissia')) return [];
+  const wantedSeason = assignedScope?.season || seasonNumber || titles.map(parseSeason).find((value) => value !== null) || null;
+  const request = { episode: options.localEpisode ?? episode, sourceEpisode: episode, season: wantedSeason ?? 1 };
+  const index = await getAnissiaArchiveIndex();
+  const sourceFiles=await readSubtitleSourceManifest(root);
+  const sourceDirectories=new Map<string,Set<string>>();
+  for(const [file,record] of Object.entries(sourceFiles)) {
+    const directory=file.slice(0,file.lastIndexOf('/'));
+    const ids=sourceDirectories.get(directory) || new Set<string>();
+    record.sources.filter(s=>s.source==='anissia').forEach(s=>ids.add(s.id));sourceDirectories.set(directory,ids);
+  }
+  const matched: Array<{ entry: AnissiaArchiveIndexEntry; title: string; creator: string; website: string; order: number }> = [];
+
+  for (const entry of index) {
+    const folderParts = anissiaFolderParts(entry.finishPath);
+    const workPath = path.relative(path.join(root,'anissia_subtitles'),path.dirname(entry.finishPath)).split(path.sep)[0];
+    if ((assignedScope?.type === 'local' || assignedScope?.type === 'folder') && assignedScope.work !== workPath) continue;
+    const metadataAnimeNo = recordNumber(entry.record, ["animeNo", "anime_no", "anissiaNo"]);
+    if (metadataAnimeNo && folderParts.animeNo && metadataAnimeNo !== folderParts.animeNo) continue;
+    const recordAnimeNo = metadataAnimeNo || folderParts.animeNo;
+    const folderTitle = folderParts.title || path.basename(path.dirname(path.dirname(path.dirname(entry.finishPath))));
+    const recordTitle = recordValue(entry.record, ["subject", "animeTitle", "workTitle", "title", "anime_name", "work"]) || folderTitle;
+    const exactTitleMatch = [recordTitle, folderTitle].some((value) => wantedTitles.has(normalizeBlogTitle(value)));
+    const folderNameMatch = (assignedScope?.type === 'local' || assignedScope?.type === 'folder') ? true : folderNameQuery
+      ? normalizeBlogTitle(folderTitle).includes(folderNameQuery)
+      : animeNo && recordAnimeNo ? recordAnimeNo === animeNo : exactTitleMatch;
+    const directoryKey=path.relative(root,path.dirname(entry.finishPath)).split(path.sep).join('/');
+    const hasSourceId=animeNo && sourceDirectories.get(directoryKey)?.has(String(animeNo));
+    if (!folderNameMatch && !hasSourceId) continue;
+
+    // A marker at the work root describes the last download, not every file
+    // in a flattened multi-episode folder. Require per-file episode evidence.
+    const recordEpisode = folderParts.episode
+      ? recordValue(entry.record, ["episode", "episodeNumber", "episode_number", "episodeNo", "ep"]) : "";
+    const episodeFolder = folderParts.episode;
+    if (!options.manualSearch && [readEpisodeEvidence(recordEpisode), readEpisodeEvidence(episodeFolder)].some(e => !evidenceAgrees(e, request))) continue;
+
+    const titleSeason = parseSeason(recordTitle) || parseSeason(folderTitle);
+    if (!options.manualSearch && !assignedScope && wantedSeason && titleSeason && wantedSeason !== titleSeason) continue;
+    const creator = recordValue(entry.record, ["name", "creator", "creatorName", "captionName"]) || folderParts.creator || "로컬 파일";
+    const website = recordValue(entry.record, ["website", "url", "sourceUrl"]);
+    const timestamp = Date.parse(entry.updatedAt) || 0;
+    matched.push({ entry, title: recordTitle, creator, website, order: timestamp });
+  }
+
+  matched.sort((a, b) => b.order - a.order);
+  const results: AnissiaArchiveSubtitle[] = [];
+  for (const candidate of matched) {
+    const dir = path.dirname(candidate.entry.finishPath);
+    const folderParts = anissiaFolderParts(candidate.entry.finishPath);
+    let files: string[] = [];
+    try { files = await readdir(dir); } catch { continue; }
+    const archives = files.filter((name) => name.toLowerCase().endsWith(".zip"))
+      .sort((a, b) => Number(b.toLowerCase() === "subtitle.zip") - Number(a.toLowerCase() === "subtitle.zip") ||
+        a.localeCompare(b, undefined, { numeric: true }));
+    const loose = files.filter((name) => /\.(ass|ssa|smi|srt|vtt)$/i.test(name));
+    const recordEpisode = folderParts.episode
+      ? recordValue(candidate.entry.record, ["episode", "episodeNumber", "episode_number", "episodeNo", "ep"]) : "";
+    const episodeFolder = folderParts.episode;
+    const outer = [...(assignedScope ? [{...readEpisodeEvidence(''),season:assignedScope.season}] : [readEpisodeEvidence(candidate.title)]),readEpisodeEvidence(recordEpisode),readEpisodeEvidence(episodeFolder)];
+
+    for (const filename of [...archives, ...loose]) {
+      try {
+        const filePath = path.join(dir, filename);
+        const sourceRecord=sourceFiles[path.relative(root,filePath).split(path.sep).join('/')];
+        if(!assignedScope && animeNo && !sourceRecord && recordNumber(candidate.entry.record,["animeNo","anime_no","anissiaNo"]) && recordNumber(candidate.entry.record,["animeNo","anime_no","anissiaNo"])!==animeNo)continue;
+        if(!assignedScope && animeNo && sourceRecord && !sourceRecord.sources.some(s=>s.source==='anissia' && s.id===String(animeNo))) continue;
+        const info = await stat(filePath);
+        if (!info.isFile() || info.size <= 0 || info.size > 100 * 1024 * 1024) continue;
+
+        const addSubtitle = (subtitle: ReturnType<typeof extractSubtitleFromBuffer>, bytes: Buffer, member: string, confirmed: boolean) => {
+          if (!subtitle?.content) return;
+          const identity = anissiaTrackIdentity(candidate.creator, filename, subtitle.orig_filename, episode);
+          const relative = path.relative(root,filePath).split(path.sep).join('/');
+          const scope = subtitleScope(member || filename, `${candidate.title} ${filename}`, parseSeason(candidate.title) || 1);
+          const bundle = rawBundleIdentity('anissia',relative,member,candidate.creator,candidate.title,sourceRecord);
+          const sourceBundleKey = bundle.sourceBundleKey;
+          if (options.bundleKey && !bundleMatchesAssignment(options.bundleKey,sourceBundleKey)) return;
+          const expectedKind = assignedScope?.kind || subtitleScope('',titles.join(' ')).kind;
+          if (!options.manualSearch && parseBundleScope(sourceBundleKey)!.kind !== expectedKind) return;
+          results.push({
+            name: subtitle.filename,
+            orig_filename: subtitle.orig_filename,
+            content: subtitle.content,
+            format: subtitle.format,
+            is_ass: subtitle.is_ass,
+            episode,
+            creator: candidate.creator,
+            website: candidate.website,
+            matchedTitle: candidate.title,
+            updatedAt: candidate.entry.updatedAt,
+            animeNo: sourceRecord ? Number(sourceRecord.sources.find(s=>s.source==='anissia' && (!animeNo || s.id===String(animeNo)))?.id) || null : recordNumber(candidate.entry.record, ["animeNo", "anime_no", "anissiaNo"]) || folderParts.animeNo,
+            archiveFilename: filename,
+            ...identity, sourceBundleKey, sourceFolderKey:bundle.sourceFolderKey,sourceFolderLabel:bundle.sourceFolderLabel,
+            sourceBundleLabel: bundle.sourceBundleLabel,
+            localFileId: localFileKey(path.relative(root,filePath).split(path.sep).join('/'),member,createHash('sha256').update(bytes).digest('hex')),
+            episodeConfirmed: confirmed,
+          });
+        };
+
+        if (filename.toLowerCase().endsWith(".zip")) {
+          const archiveBytes=await readFile(filePath);if(!sourceDigestMatches(sourceRecord,archiveBytes))continue;
+          const { zip, entries } = inspectSubtitleArchive(archiveBytes);
+          const scoped = options.bundleKey ? entries.filter(item=>bundleMatchesAssignment(options.bundleKey!,rawBundleIdentity('anissia',path.relative(root,filePath).split(path.sep).join('/'),item.filename,candidate.creator,candidate.title,sourceRecord).sourceBundleKey)) : entries;
+          const archiveEvidence=readEpisodeEvidence(filename,true);
+          if(assignedScope) archiveEvidence.season=null;
+          const selectedEntries = selectEpisodeEntries(scoped, request,[...outer, archiveEvidence]);
+          const manualEntries = options.manualSearch ? entries : [];
+          for (const item of [...new Map([...selectedEntries,...manualEntries].map(item=>[item.index,item])).values()]) {
+            try {
+              const bytes = zip.getEntries()[item.index].getData();
+              addSubtitle(decodeSubtitleFile(bytes, item.filename),bytes,item.filename,selectedEntries.includes(item));
+            } catch {}
+            if (results.length >= resultLimit) break;
+          }
+        } else {
+          const bytes = await readFile(filePath);if(!sourceDigestMatches(sourceRecord,bytes))continue;
+          const exact = extractSubtitleFromBuffer(bytes, episode, filename, true, wantedSeason,
+            { localEpisode: request.episode, evidence: outer });
+          const manual = options.manualSearch;
+          addSubtitle(exact || (manual ? decodeSubtitleFile(bytes,filename) : null),bytes,'',Boolean(exact));
+        }
+      } catch {}
+      if (results.length >= resultLimit) break;
+    }
+    if (results.length >= resultLimit) break;
+  }
+  return results;
+}
+
+async function folderSubtitleFiles(directory:string) {
+  const pending=[{dir:directory,depth:0}],files:string[]=[];
+  while(pending.length) {
+    const current=pending.pop()!;
+    for(const entry of await readdir(current.dir,{withFileTypes:true})) {
+      if(entry.name.startsWith('.') || entry.name==='__MACOSX')continue;
+      const file=path.join(current.dir,entry.name);
+      if(entry.isDirectory() && current.depth<10)pending.push({dir:file,depth:current.depth+1});
+      else if(entry.isFile() && /\.(?:zip|ass|ssa|smi|srt|vtt)$/i.test(entry.name))files.push(path.relative(directory,file).split(path.sep).join('/'));
+    }
+    if(files.length>10000)throw new Error('Too many subtitles in selected folder');
+  }
+  return files;
+}
+export async function getAniAllArchiveSubtitles(blogTitle: string, episode: number, seasonNumber: number | null = null,
+  startEpisodeOverride: number | null = null, postUrl = '', options: {bundleKey?: string; manualSearch?: boolean} = {}) {
+  const corpus = path.join(root, 'aniall_subtitles');
+  const assigned = options.bundleKey ? parseBundleScope(options.bundleKey) : null;
+  if (options.bundleKey && (!assigned || (assigned.type!=='local' && assigned.type!=='folder') || assigned.provider !== 'aniall')) return [];
+  let folders: string[];
+  try { folders = await readdir(corpus); } catch (error: any) { if (error?.code === 'ENOENT') return []; throw error; }
+  const postId = postUrl.match(/^https?:\/\/aniall\.tistory\.com\/([1-9]\d*)(?:[/?#]|$)/i)?.[1];
+  const sourceFiles=await readSubtitleSourceManifest(root);
+  const registeredFolders=postId ? [...new Set(Object.entries(sourceFiles).filter(([p,r])=>p.startsWith('aniall_subtitles/') && r.sources.some(s=>s.source==='aniall' && s.id===postId)).map(([p])=>p.split('/')[1]))].filter(p=>folders.includes(p)) : [];
+  if(registeredFolders.length>1 && !assigned) return [];
+  const numbered = postId ? folders.filter(name => name.startsWith(`${postId}__`)) : [];
+  if (numbered.length > 1) return [];
+  const folder = (assigned?.type === 'local' || assigned?.type === 'folder') ? folders.find(name => name === assigned.work)
+    : registeredFolders[0] || numbered[0] || folders.find(name => !/^[1-9]\d*__/.test(name) && normalizeBlogTitle(name) === normalizeBlogTitle(blogTitle));
+  if (!folder) return [];
+  const folderTitle = folder.replace(/^[1-9]\d*__/, '');
+  const dir = path.join(corpus,folder), names = assigned?.type==='folder' ? await folderSubtitleFiles(dir) : await readdir(dir);
+  const sourceFor=(filename:string)=>sourceFiles[`aniall_subtitles/${folder}/${filename}`];
+  const eligibleFile=(filename:string)=>!sourceFor(filename) || Boolean(options.bundleKey || options.manualSearch || (postId && sourceFor(filename)!.sources.some(s=>s.source==='aniall' && s.id===postId)));
+  const request = {episode,sourceEpisode:(startEpisodeOverride || 1)+episode-1,season:assigned?.season || seasonNumber || 1};
+  const wantedKind = assigned?.kind || subtitleScope('',blogTitle).kind;
+  const results: Array<{blogTitle:string;name:string;orig_filename:string;content:string;format:'ASS'|'VTT';is_ass:boolean;
+    sourceBundleKey:string;sourceBundleLabel:string;sourceFolderKey:string;sourceFolderLabel:string;localFileId:string;episodeConfirmed:boolean}> = [];
+  const add = (filename: string, member: string, bytes: Buffer, confirmed: boolean) => {
+    const scope = subtitleScope(member || filename, `${folderTitle} ${filename}`,parseSeason(folderTitle) || 1);
+    const relative=path.relative(root,path.join(dir,filename)).split(path.sep).join('/');
+    const bundle=rawBundleIdentity('aniall',relative,member,'aniall',folderTitle,sourceFor(filename)), key=bundle.sourceBundleKey;
+    if ((options.bundleKey && !bundleMatchesAssignment(options.bundleKey,key)) || (!options.manualSearch && scope.kind !== wantedKind)) return;
+    const subtitle = decodeSubtitleFile(bytes,member || filename);
+    if (!subtitle?.content) return;
+    results.push({blogTitle:folderTitle,name:subtitle.filename,orig_filename:subtitle.orig_filename,content:subtitle.content,
+      format:subtitle.format,is_ass:subtitle.is_ass,sourceBundleKey:key,sourceBundleLabel:bundle.sourceBundleLabel,sourceFolderKey:bundle.sourceFolderKey,sourceFolderLabel:bundle.sourceFolderLabel,episodeConfirmed:confirmed,
+      localFileId:localFileKey(path.relative(root,path.join(dir,filename)).split(path.sep).join('/'),member,createHash('sha256').update(bytes).digest('hex'))});
+  };
+  for (const filename of names.filter(n=>/\.zip$/i.test(n) && eligibleFile(n)).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}))) {
+    try {
+      const file = path.join(dir,filename), info = await stat(file);
+      if (!info.isFile() || !info.size || info.size > 100*1024*1024) continue;
+      const archiveBytes=await readFile(file);if(!sourceDigestMatches(sourceFor(filename),archiveBytes))continue;
+      const {zip,entries} = inspectSubtitleArchive(archiveBytes);
+      const scoped=options.bundleKey ? entries.filter(e=>bundleMatchesAssignment(options.bundleKey!,rawBundleIdentity('aniall',path.relative(root,file).split(path.sep).join('/'),e.filename,'aniall',folderTitle,sourceFor(filename)).sourceBundleKey)) : entries;
+      const archiveEvidence=readEpisodeEvidence(filename,true);if(assigned) archiveEvidence.season=null;
+      const selected = selectEpisodeEntries(scoped,request,[...(assigned?[{...readEpisodeEvidence(''),season:assigned.season}]:[readEpisodeEvidence(folderTitle)]),archiveEvidence]);
+      const manual = options.manualSearch ? entries : [];
+      for (const entry of [...new Map([...selected,...manual].map(e=>[e.index,e])).values()]) {
+        add(filename,entry.filename,zip.getEntries()[entry.index].getData(),selected.includes(entry));
+        if(results.length>=50) break;
+      }
+    } catch { /* An unreadable ZIP cannot authorize a different episode. */ }
+    if(results.length>=50) break;
+  }
+  const loose = names.filter(n=>/\.(?:ass|ssa|srt|smi|vtt)$/i.test(n) && eligibleFile(n)).map(filename=>({filename}));
+  const scopedLoose=options.bundleKey ? loose.filter(e=>bundleMatchesAssignment(options.bundleKey!,rawBundleIdentity('aniall',path.relative(root,path.join(dir,e.filename)).split(path.sep).join('/'),'','aniall',folderTitle,sourceFor(e.filename)).sourceBundleKey)) : loose;
+  const selected = selectEpisodeEntries(scopedLoose,request,assigned ? [{...readEpisodeEvidence(''),season:assigned.season}] : [readEpisodeEvidence(folderTitle)]);
+  const manual = options.manualSearch ? loose : [];
+  for (const entry of [...new Map([...selected,...manual].map(e=>[e.filename,e])).values()]) {
+    try {
+      const file=path.join(dir,entry.filename),info=await stat(file);
+      if(info.isFile() && info.size > 0 && info.size <= 2*1024*1024) {const bytes=await readFile(file);if(sourceDigestMatches(sourceFor(entry.filename),bytes))add(entry.filename,'',bytes,selected.includes(entry));}
+    } catch { /* Keep other readable candidates available for manual selection. */ }
+    if(results.length>=50) break;
+  }
+  return results;
+}
+
+/** Legacy single-result callers never resolve a variant conflict by file order. */
+export async function getAniAllArchiveSubtitle(blogTitle: string, episode: number, seasonNumber: number | null = null,
+  startEpisodeOverride: number | null = null, postUrl = '') {
+  const subtitles = await getAniAllArchiveSubtitles(blogTitle,episode,seasonNumber,startEpisodeOverride,postUrl);
+  return subtitles.length === 1 ? subtitles[0] : null;
+}
+
+/** Resolve one exact user-selected local file. Its original bytes must still match. */
+export async function getLocalSubtitleFile(fileId: string) {
+  const reference=parseLocalFileKey(fileId);
+  if(!reference) return null;
+  const parts=reference.relative.split('/');
+  const provider=parts[0]==='aniall_subtitles'?'aniall':parts[0]==='anissia_subtitles'?'anissia':null;
+  if(!provider || parts.length<3) return null;
+  try {
+    const file=path.join(root,reference.relative),resolved=await realpath(file);
+    const allowed=await realpath(path.join(root,`${provider}_subtitles`));
+    if(!allowed.startsWith((await realpath(root))+path.sep)) return null;
+    if(!resolved.startsWith(allowed+path.sep)) return null;
+    const info=await stat(resolved);
+    if(!info.isFile() || !info.size || info.size>100*1024*1024) return null;
+    const sourceRecord=(await readSubtitleSourceManifest(root))[reference.relative];
+    const originalBytes=await readFile(resolved);if(!sourceDigestMatches(sourceRecord,originalBytes))return null;
+    let bytes: Buffer, filename=path.basename(file);
+    if(reference.member) {
+      if(!/\.zip$/i.test(file)) return null;
+      const {zip,entries}=inspectSubtitleArchive(originalBytes);
+      const selected=entries.find(e=>e.filename===reference.member);
+      if(!selected) return null;
+      bytes=zip.getEntries()[selected.index].getData();filename=selected.filename;
+    } else {
+      if(info.size>2*1024*1024 || !/\.(ass|ssa|smi|srt|vtt)$/i.test(file)) return null;
+      bytes=originalBytes;
+    }
+    if(createHash('sha256').update(bytes).digest('hex')!==reference.sha256) return null;
+    const subtitle=decodeSubtitleFile(bytes,filename);if(!subtitle?.content) return null;
+    const entry=provider==='anissia' ? (await getAnissiaArchiveIndex()).find(e=>path.dirname(e.finishPath)===path.dirname(file)) : null;
+    const title=parts[1].replace(/^[1-9]\d*__/, '');
+    const creator=provider==='aniall'?'aniall':entry ? recordValue(entry.record,['name','creator','creatorName','captionName']) || parts[3] || '로컬 파일' : parts[3] || '로컬 파일';
+    const workTitle=entry ? recordValue(entry.record,['subject','animeTitle','workTitle','title','anime_name','work']) || title : title;
+    return {name:subtitle.filename,orig_filename:subtitle.orig_filename,content:subtitle.content,format:subtitle.format,is_ass:subtitle.is_ass,
+      localFileId:fileId,sourceProvider:provider,sourceMatchedTitle:workTitle,localArchive:true,
+      ...rawBundleIdentity(provider,reference.relative,reference.member,creator,workTitle,sourceRecord)};
+  } catch(error:any) { if(error?.code!=='ENOENT' && error?.code!=='ENOTDIR') console.warn('[Local subtitle override unreadable]',error.message); return null; }
+}
