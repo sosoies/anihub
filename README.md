@@ -41,7 +41,7 @@ Next.js 15 App Router와 Vercel Serverless, Neon Postgres를 기반으로 구축
 ### 1. 원클릭 배포 (Deploy to Vercel)
 아래 버튼이나 링크를 클릭하면 본인 깃허브 계정으로 저장소가 자동 복제(Fork)되며 Vercel 배포가 바로 진행됩니다:
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/13tahlm1-netizen/anime)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/sosoies/1)]
 
 > 🔗 **원클릭 배포 주소**:  
 >(https://vercel.com/new/import?repository-name=1&s=https%3A%2F%2Fgithub.com%2Fsosoies%2F1&teamSlug=sosoies)
