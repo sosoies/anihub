@@ -44,8 +44,7 @@ Next.js 15 App Router와 Vercel Serverless, Neon Postgres를 기반으로 구축
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/13tahlm1-netizen/anime)
 
 > 🔗 **원클릭 배포 주소**:  
-> [https://vercel.com/new/clone?repository-url=https://github.com/13tahlm1-netizen/anime](https://vercel.com/new/clone?repository-url=https://github.com/13tahlm1-netizen/anime)
-
+>(https://vercel.com/new/import?repository-name=1&s=https%3A%2F%2Fgithub.com%2Fsosoies%2F1&teamSlug=sosoies)
 ### 2. 데이터베이스 원클릭 자동 연동 (1초 컷)
 1. 배포 완료 후 Vercel 프로젝트 대시보드 상단의 **`Storage`** 탭을 클릭합니다.
 2. **`Create Database` ➔ `Neon (Postgres)`**을 선택하고 **`Continue`**를 누릅니다.
