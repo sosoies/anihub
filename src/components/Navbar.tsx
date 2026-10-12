@@ -149,11 +149,6 @@ export default function Navbar() {
           </div>
         </form>
 
-        <Link href="/catalog" className="hidden shrink-0 text-xs font-semibold text-purple-300 hover:text-white lg:inline-flex">한글 DB</Link>
-        <Link href="/unmatched" className="hidden shrink-0 items-center gap-1.5 text-xs font-semibold text-amber-300 hover:text-white xl:inline-flex">
-          <Link2 className="h-4 w-4" /> 미연결 작품
-        </Link>
-
         {/* Right Auth & Settings Controls (Integrated Menu) */}
         <div className="relative flex items-center gap-2 shrink-0" ref={menuRef}>
           {/* 스트리밍 사이트 스위처 버튼 */}
@@ -167,25 +162,6 @@ export default function Navbar() {
             <span className="font-bold text-[11px] text-purple-300">
               {activeSource === "anissia" ? "애니시아" : activeSource === "reanime" ? "ReAnime" : activeSource === "ohli24" ? "Ohli24" : "Linkkf"}
             </span>
-          </button>
-
-          {/* 도메인 설정 버튼 */}
-          <button
-            type="button"
-            onClick={() => setIsSettingsOpen(true)}
-            title="스트리밍 도메인(베이스 URL) 주소 설정"
-            className="relative flex h-8 w-8 items-center justify-center rounded-full border border-purple-500/30 bg-slate-900/80 text-slate-300 hover:text-white hover:border-purple-500/60 hover:bg-slate-800 transition shadow-sm"
-          >
-            <Globe className="h-4 w-4 text-sky-400" />
-            <span
-              className={`absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-[#0b0f19] ${
-                domainStatus === "healthy"
-                  ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]"
-                  : domainStatus === "unhealthy"
-                  ? "bg-rose-500 animate-pulse"
-                  : "bg-slate-500"
-              }`}
-            />
           </button>
 
           {!isLoadingAuth && (
